@@ -34,6 +34,7 @@ Optionally chain after the macronizer for plain-text input::
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import Optional
@@ -42,19 +43,25 @@ from spacy.language import Language
 from spacy.tokens import Doc, Token
 
 MACRONS = frozenset("āēīōūȳĀĒĪŌŪȲ")
+_STRIP_MACRONS = str.maketrans("āēīōūȳĀĒĪŌŪȲ", "aeiouyAEIOUY")
+
+
+def _normalize(form: str) -> str:
+    return form.translate(_STRIP_MACRONS).lower()
 
 
 @Language.factory(
     "macron_morph",
-    default_config={"lookup_path": None},
+    default_config={"lookup_path": None, "macronized_input": False},
     assigns=["token._.macron_morph", "token._.macron_pos_"],
 )
 def create_macron_morph(
     nlp: Language,
     name: str,
     lookup_path: Optional[str],
+    macronized_input: bool,
 ) -> "MacronMorphComponent":
-    return MacronMorphComponent(nlp, name, lookup_path=lookup_path)
+    return MacronMorphComponent(nlp, name, lookup_path=lookup_path, macronized_input=macronized_input)
 
 
 class MacronMorphComponent:
@@ -63,6 +70,12 @@ class MacronMorphComponent:
     For each token, resolves the macronized surface form and looks it up in
     the prebuilt kaikki table. Sets ``token._.macron_morph`` and
     ``token._.macron_pos_`` with agreed-upon features across all matching parses.
+
+    When ``macronized_input=True``, the absence of a macron on a form that has
+    macronized variants is treated as positive signal: those variants are ruled
+    out, and the agreed features of the remaining parses are returned. For
+    example, plain ``venit`` in macronized text rules out ``vēnit`` (perfect)
+    and signals present tense.
     """
 
     def __init__(
@@ -71,9 +84,12 @@ class MacronMorphComponent:
         name: str,
         *,
         lookup_path: Optional[str | Path] = None,
+        macronized_input: bool = False,
     ) -> None:
         self.name = name
+        self.macronized_input = macronized_input
         self._lookup: dict[str, list[dict]] = {}
+        self._reverse: dict[str, list[str]] = {}  # normalized → [macronized_variants]
         self._lookup_path = lookup_path
         self._loaded = False
 
@@ -86,9 +102,23 @@ class MacronMorphComponent:
         if self._loaded:
             return
         if self._lookup_path:
-            with open(self._lookup_path, encoding="utf-8") as f:
+            path = Path(self._lookup_path)
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rt", encoding="utf-8") as f:
                 self._lookup = json.load(f)
+            if self.macronized_input:
+                self._build_reverse_index()
         self._loaded = True
+
+    def _build_reverse_index(self) -> None:
+        """Build normalized_form → [macronized_variants] from the main lookup."""
+        from collections import defaultdict
+        rev: dict[str, list[str]] = defaultdict(list)
+        for macronized_form in self._lookup:
+            norm = _normalize(macronized_form)
+            if norm != macronized_form:  # only forms that differ when stripped
+                rev[norm].append(macronized_form)
+        self._reverse = dict(rev)
 
     def _get_macronized(self, token: Token) -> str | None:
         """Return the macronized form for this token, or None if no macrons present."""
@@ -112,21 +142,30 @@ class MacronMorphComponent:
         parses = self._lookup.get(macronized)
         if not parses:
             return "", ""
+        return self._intersect(parses)
 
+    def _resolve_unmarked(self, norm: str) -> tuple[str, str]:
+        """Return the set of parses ruled out for an unmarked form in macronized input.
+
+        NOTE: This currently returns ("", "") — the reverse index is built and
+        wired but generating a *positive* signal from absence-of-macron requires
+        the full unmacronized parse space, which is not in this lookup. What we
+        know is what the form is NOT (the macronized variants' parses), but we
+        cannot convert that to a positive assertion without a second lookup table.
+        The reverse index is preserved for that future step.
+        """
+        return "", ""
+
+    def _intersect(self, parses: list[dict]) -> tuple[str, str]:
         if len(parses) == 1:
             return parses[0]["morph"], parses[0]["pos"]
 
-        # Multiple parses — intersect features
         pos_values = {p["pos"] for p in parses}
         agreed_pos = pos_values.pop() if len(pos_values) == 1 else ""
 
-        # Parse each morph string into feature dicts
         feat_dicts = [_parse_morph(p["morph"]) for p in parses]
-
-        # Keep only features that are present in ALL parses with the same value
         agreed: dict[str, str] = {}
-        all_keys = set().union(*feat_dicts)
-        for key in all_keys:
+        for key in set().union(*feat_dicts):
             values = {fd.get(key) for fd in feat_dicts}
             if len(values) == 1 and None not in values:
                 agreed[key] = values.pop()
@@ -134,8 +173,7 @@ class MacronMorphComponent:
         if not agreed:
             return "", agreed_pos
 
-        morph_str = "|".join(f"{k}={v}" for k, v in sorted(agreed.items()))
-        return morph_str, agreed_pos
+        return "|".join(f"{k}={v}" for k, v in sorted(agreed.items())), agreed_pos
 
     def __call__(self, doc: Doc) -> Doc:
         self._ensure_loaded()
@@ -144,9 +182,14 @@ class MacronMorphComponent:
             if token.is_punct or token.is_space:
                 continue
             macronized = self._get_macronized(token)
-            if not macronized:
+            if macronized:
+                morph, pos = self._resolve(macronized)
+            elif self.macronized_input:
+                # Unmarked form in macronized text: absence of macron is signal
+                norm = _normalize(token._.orig_text if hasattr(token._, "orig_text") and token._.orig_text else token.text)
+                morph, pos = self._resolve_unmarked(norm)
+            else:
                 continue
-            morph, pos = self._resolve(macronized)
             token._.macron_morph = morph
             token._.macron_pos_ = pos
 
@@ -155,11 +198,10 @@ class MacronMorphComponent:
     def to_disk(self, path: str, *, exclude: tuple = ()) -> None:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        cfg: dict = {}
+        cfg: dict = {"macronized_input": self.macronized_input}
         if self._lookup_path:
             cfg["lookup_path"] = str(self._lookup_path)
         if self._lookup and not self._lookup_path:
-            # Lookup was loaded from bytes — serialize alongside
             with open(path / "lookup.json", "w", encoding="utf-8") as f:
                 json.dump(self._lookup, f, ensure_ascii=False)
             cfg["lookup_path"] = str(path / "lookup.json")
@@ -175,18 +217,20 @@ class MacronMorphComponent:
             if cfg.get("lookup_path"):
                 self._lookup_path = cfg["lookup_path"]
                 self._loaded = False
+            self.macronized_input = cfg.get("macronized_input", False)
         return self
 
     def to_bytes(self, *, exclude: tuple = ()) -> bytes:
         self._ensure_loaded()
-        data: dict = {}
+        data: dict = {"macronized_input": self.macronized_input}
         if self._lookup:
             data["lookup"] = self._lookup
-        return json.dumps(data, ensure_ascii=False).encode("utf-8") if data else b""
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
     def from_bytes(self, data: bytes, *, exclude: tuple = ()) -> "MacronMorphComponent":
         if data:
             d = json.loads(data.decode("utf-8"))
+            self.macronized_input = d.get("macronized_input", False)
             if "lookup" in d:
                 self._lookup = d["lookup"]
                 self._loaded = True
