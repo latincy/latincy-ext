@@ -81,7 +81,7 @@ The `lila_linkbank.sqlite` (~105 MB) and `lila_linkbank_full.sqlite` (~120 MB) a
 
 ## Demo Notebook
 
-[`notebooks/lila_lemmabank_linker_demo.ipynb`](notebooks/lila_lemmabank_linker_demo.ipynb) walks through the full evaluation: live linking on Caesar, orthographic robustness, coverage spike (**~99.4%** end-to-end on held-out Catullus), oracle eval (MFS baseline), and the v2 disambiguation verdict.
+[`notebooks/demo_lila_lemmabank_linker.ipynb`](notebooks/demo_lila_lemmabank_linker.ipynb) walks through the full evaluation: live linking on Caesar, orthographic robustness, coverage spike (**~99.4%** end-to-end on held-out Catullus), oracle eval (MFS baseline), and the v2 disambiguation verdict.
 
 ## Acknowledgments
 
