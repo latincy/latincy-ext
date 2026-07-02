@@ -60,18 +60,7 @@ print(res.uri, res.source)   # http://lila-erc.eu/data/id/lemma/…  lemma_pos
 
 The `db_path` can also be set via the `LATINCY_LILA_DB` environment variable.
 
-## Quick Start — `macron_morph`
-
-```python
-import latincy_ext
-
-nlp = spacy.blank("la")
-nlp.add_pipe("macron_morph", config={"lookup_path": "/path/to/latin-forms-macronized-morph.json.gz"})
-```
-
-The lookup table is built by `extract_macronized_morph.py` in [latincy-words](https://github.com/diyclassics/latincy-words).
-
-## The SQLite Artifact
+### The SQLite Artifact
 
 The `lila_linkbank.sqlite` (~105 MB) and `lila_linkbank_full.sqlite` (~120 MB) artifacts are **not bundled** with this package — they are too large and carry a distinct license.
 
