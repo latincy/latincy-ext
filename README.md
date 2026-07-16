@@ -14,6 +14,7 @@
 |-----------|-------------|
 | `lila_linker` | Resolves every token's lemma to a LiLa Lemma Bank URI via a local SQLite artifact. Four-path resolution (lemma+POS → lemma → orthographic variant → form attestation). |
 | `macron_morph` | Macron-based morphological disambiguation. Looks up the macronized form in a kaikki-derived table; sets agreed UD features across all matching parses. |
+| `syllabifier` | Latin syllabification + positional-weight (qShape) quantities. Independent reimplementation validated against CLTK's `Syllabifier` as an oracle (see [Acknowledgments](#acknowledgments)); preserves input orthography and macrons. |
 
 ## Installation
 
@@ -76,7 +77,10 @@ The `lila_linkbank.sqlite` (~105 MB) and `lila_linkbank_full.sqlite` (~120 MB) a
 
 Thank you to Marco Passarotti (CIRCSE Research Centre, Università Cattolica del Sacro Cuore) and the LiLa team for recommending the LatinCy / LiLa Lemma Bank integration; the supporting "link" dataset derives from the [**LiLa Lemma Bank**](https://lila-erc.eu/query/).
 
+The `syllabifier` component is an independent reimplementation of Latin syllabification, developed and validated against the [**Classical Language Toolkit (CLTK)**](https://github.com/cltk/cltk) syllabifier `cltk.prosody.lat.Syllabifier` (author: Todd Cook; MIT License) as a test oracle. No CLTK code is imported or vendored, and the two deliberately diverge on some boundaries (e.g. `rup·tus` vs. CLTK's `ru·ptus`); CLTK is credited here with thanks.
+
 
 ## Bibliography
 
 - Mambrini, F., & Passarotti, M. C. (2023). The LiLa Lemma Bank: A knowledge base of Latin canonical forms. *Journal of Open Humanities Data*, 9(1), 28. https://doi.org/10.5334/johd.145
+- Johnson, K. P., Burns, P. J., Stewart, J., Cook, T., Besnier, C., & Mattingly, W. J. B. (2021). The Classical Language Toolkit: An NLP framework for pre-modern languages. In *Proceedings of the 59th Annual Meeting of the ACL and the 11th IJCNLP: System Demonstrations* (pp. 20–29). https://aclanthology.org/2021.acl-demo.3/

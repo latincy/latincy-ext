@@ -41,3 +41,7 @@ htmlcov/
 
 # Claude Code local configuration
 .claude/
+
+# TTS demo audio + cache (regenerable output, never commit)
+*.wav
+.tts_cache/
