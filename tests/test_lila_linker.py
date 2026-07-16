@@ -16,6 +16,10 @@ URI_CIUIS = "http://lila-erc.eu/data/id/lemma/222"
 URI_WR    = "http://lila-erc.eu/data/id/lemma/333"  # reached via wr_uri only
 URI_FORM  = "http://lila-erc.eu/data/id/lemma/444"  # reached via form_uri only
 
+# real LiLa URIs the ut rule keys on
+UT_PURPOSE  = "http://lila-erc.eu/data/id/lemma/130906"  # +subjunctive (MFS)
+UT_TEMPORAL = "http://lila-erc.eu/data/id/lemma/130905"  # +indicative
+
 
 def _build_db(path: str) -> None:
     con = sqlite3.connect(path)
@@ -46,14 +50,24 @@ def _build_db(path: str) -> None:
     con.executemany(
         "INSERT INTO lemma_uri VALUES (?,?,?,?,?,?)",
         [
-            ("sum",     "AUX",  URI_SUM,   "lemma", 100, 1),
-            ("sum",     "VERB", URI_SUM,   "lemma",  10, 0),
-            ("ciuitas", "NOUN", URI_CIUIS, "lemma",  50, 1),
+            ("sum",     "AUX",  URI_SUM,     "lemma", 100, 1),
+            ("sum",     "VERB", URI_SUM,     "lemma",  10, 0),
+            ("ciuitas", "NOUN", URI_CIUIS,   "lemma",  50, 1),
+            # a genuinely ambiguous (lemma,UPOS): 78% / 22% split → tests
+            # confidence/margin and the ut disambiguation rule.
+            ("ut",      "SCONJ", UT_PURPOSE,  "lemma", 13927, 1),
+            ("ut",      "SCONJ", UT_TEMPORAL, "lemma",  3902, 1),
         ],
     )
+    con.execute("INSERT INTO meta VALUES ('backbone_license', 'CC-BY-SA 4.0')")
     con.executemany(
         "INSERT INTO wr_uri VALUES (?,?,?)",
-        [("ciuitatem", URI_WR, "lemma")],  # an orthographic variant
+        [
+            ("ciuitatem", URI_WR, "lemma"),  # single orthographic variant
+            # two backbone candidates, no attestation → confidence is unknowable
+            ("ambiwr", URI_SUM, "lemma"),
+            ("ambiwr", URI_CIUIS, "lemma"),
+        ],
     )
     con.executemany(
         "INSERT INTO form_uri VALUES (?,?,?)",
@@ -225,10 +239,208 @@ class TestSerialization:
     def test_to_disk_from_disk_roundtrip(self, db_path, tmp_path):
         from latincy_ext.lila_linker import LilaLinker
         save_dir = tmp_path / "pipe"
-        LilaLinker(db_path).to_disk(str(save_dir))
+        LilaLinker(db_path, disambiguate=True, form_policy="promote").to_disk(str(save_dir))
 
         restored = LilaLinker(db_path).from_disk(str(save_dir))
         assert restored.db_path == db_path
+        assert restored.disambiguate is True
+        assert restored.form_policy == "promote"
         # resolver still works after reload
         res = restored.resolver.resolve("sum", "AUX")
         assert res.uri == URI_SUM
+
+
+# ---------------------------------------------------------------------------
+# Item 2 — confidence / margin
+# ---------------------------------------------------------------------------
+
+class TestConfidence:
+    def test_single_candidate_is_fully_confident(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        res = LilaResolver(db_path).resolve("ciuitas", "NOUN")
+        assert res.confidence == 1.0
+        assert res.margin == 1.0
+
+    def test_ambiguous_key_confidence_is_top_share(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        res = LilaResolver(db_path).resolve("ut", "SCONJ")
+        # 13927 / (13927+3902) == 0.781
+        assert res.confidence == pytest.approx(13927 / 17829, abs=1e-6)
+        assert res.margin == pytest.approx((13927 - 3902) / 17829, abs=1e-6)
+
+    def test_single_backbone_hit_is_confident(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        # one backbone candidate → nothing to compete with → confident link
+        res = LilaResolver(db_path).resolve("ciuitatem", "NOUN")
+        assert res.source == "wr"
+        assert res.confidence == 1.0
+
+    def test_multi_backbone_hit_has_no_confidence(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        # ≥2 backbone candidates with no attestation → confidence is unknowable,
+        # not fabricated from a zero-frequency tie
+        res = LilaResolver(db_path).resolve("ambiwr", "NOUN")
+        assert res.source == "wr"
+        assert len(res.candidates) == 2
+        assert res.confidence is None
+        assert res.margin is None
+
+    def test_component_sets_confidence_extension(self, linker):
+        doc = _doc_with_lemma("ut", "SCONJ")
+        doc = linker(doc)
+        assert doc[0]._.lila_confidence == pytest.approx(13927 / 17829, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Item 5 — form_uri policy
+# ---------------------------------------------------------------------------
+
+class TestFormPolicy:
+    def test_abstain_is_default(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        res = LilaResolver(db_path).resolve("zzznolemma", "NOUN", "formfall")
+        assert res.source == "form"
+        assert res.uri is None
+        assert res.candidates == [URI_FORM]
+
+    def test_promote_returns_top_uri(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        res = LilaResolver(db_path, form_policy="promote").resolve(
+            "zzznolemma", "NOUN", "formfall"
+        )
+        assert res.source == "form"
+        assert res.uri == URI_FORM
+
+    def test_invalid_policy_rejected(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        with pytest.raises(ValueError, match="form_policy"):
+            LilaResolver(db_path, form_policy="nonsense")
+
+
+# ---------------------------------------------------------------------------
+# Item 1 — FEATS/dep disambiguation rule (ut by clause mood)
+# ---------------------------------------------------------------------------
+
+def _ut_doc(mood: str) -> "spacy.tokens.Doc":
+    """Doc 'ut <verb>' with ut(SCONJ) marking a governed verb of the given mood."""
+    nlp = spacy.blank("la")
+    doc = nlp.make_doc("ut uenit")
+    doc[0].lemma_, doc[0].pos_ = "ut", "SCONJ"
+    doc[1].lemma_, doc[1].pos_ = "uenio", "VERB"
+    doc[1].set_morph(f"Mood={mood}|VerbForm=Fin")
+    doc[0].head = doc[1]  # ut attaches as mark to its clause verb
+    return doc
+
+
+class TestDisambiguation:
+    def test_indicative_ut_picks_temporal(self, db_path):
+        _nlp = spacy.blank("la")
+        _nlp.add_pipe("lila_linker", config={"db_path": db_path, "disambiguate": True})
+        pipe = _nlp.get_pipe("lila_linker")
+        doc = pipe(_ut_doc("Ind"))
+        assert doc[0]._.lila_uri == UT_TEMPORAL
+        assert doc[0]._.lila_source == "rule:ut_mood"
+        assert doc[0]._.lila_candidates[0] == UT_TEMPORAL  # pick surfaced first
+
+    def test_subjunctive_ut_keeps_mfs(self, db_path):
+        _nlp = spacy.blank("la")
+        _nlp.add_pipe("lila_linker", config={"db_path": db_path, "disambiguate": True})
+        pipe = _nlp.get_pipe("lila_linker")
+        doc = pipe(_ut_doc("Sub"))
+        assert doc[0]._.lila_uri == UT_PURPOSE
+        assert doc[0]._.lila_source == "lemma_pos"
+
+    def test_disambiguate_off_leaves_mfs(self, db_path):
+        _nlp = spacy.blank("la")
+        _nlp.add_pipe("lila_linker", config={"db_path": db_path, "disambiguate": False})
+        pipe = _nlp.get_pipe("lila_linker")
+        doc = pipe(_ut_doc("Ind"))
+        assert doc[0]._.lila_uri == UT_PURPOSE  # MFS, rule not consulted
+
+    def test_governed_mood_reads_head(self):
+        from latincy_ext.lila_disambiguate import governed_mood
+        assert governed_mood(_ut_doc("Ind")[0]) == "Ind"
+        assert governed_mood(_ut_doc("Sub")[0]) == "Sub"
+
+
+# ---------------------------------------------------------------------------
+# Item 3 — macron length-aware key
+# ---------------------------------------------------------------------------
+
+URI_MALUM_APPLE = "http://lila-erc.eu/data/id/lemma/555"  # mālum
+URI_MALUM_EVIL  = "http://lila-erc.eu/data/id/lemma/556"  # malum
+
+
+@pytest.fixture(scope="module")
+def macron_db_path(tmp_path_factory):
+    p = tmp_path_factory.mktemp("lila_macron") / "linkbank.sqlite"
+    con = sqlite3.connect(str(p))
+    con.executescript("""
+        CREATE TABLE lemma_uri (
+            norm_key   TEXT NOT NULL,
+            macron_key TEXT,
+            upos       TEXT NOT NULL,
+            uri        TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            freq       INTEGER NOT NULL DEFAULT 0,
+            is_gold    INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    con.executemany(
+        "INSERT INTO lemma_uri(norm_key,macron_key,upos,uri,kind,freq,is_gold) VALUES (?,?,?,?,?,?,?)",
+        [
+            ("malum", "mālum", "NOUN", URI_MALUM_APPLE, "lemma", 30, 1),
+            ("malum", "malum", "NOUN", URI_MALUM_EVIL,  "lemma", 70, 1),
+        ],
+    )
+    con.commit()
+    con.close()
+    return str(p)
+
+
+class TestMacronKey:
+    def test_normalize_macron_preserves_length(self):
+        from latincy_ext.lila_linker import normalize_lemma_macron, normalize_lemma
+        assert normalize_lemma_macron("mālum") != normalize_lemma_macron("malum")
+        # length-blind key still collapses them
+        assert normalize_lemma("mālum") == normalize_lemma("malum")
+
+    def test_macron_capability_detected(self, macron_db_path, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        assert LilaResolver(macron_db_path).has_macron is True
+        assert LilaResolver(db_path).has_macron is False
+
+    def test_macron_splits_length_homographs(self, macron_db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        r = LilaResolver(macron_db_path)
+        assert r.resolve("malum", "NOUN", macron="mālum").uri == URI_MALUM_APPLE
+        assert r.resolve("malum", "NOUN", macron="malum").uri == URI_MALUM_EVIL
+
+    def test_macron_source_tag(self, macron_db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        res = LilaResolver(macron_db_path).resolve("malum", "NOUN", macron="mālum")
+        assert res.source == "macron_pos"
+
+    def test_no_macron_falls_back_to_mfs(self, macron_db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        # without a macron signal, length-blind key → MFS by freq (evil, 70)
+        assert LilaResolver(macron_db_path).resolve("malum", "NOUN").uri == URI_MALUM_EVIL
+
+    def test_macron_ignored_when_artifact_lacks_keys(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        # passing a macron signal to a non-macron artifact must not error
+        res = LilaResolver(db_path).resolve("sum", "AUX", macron="sūm")
+        assert res.uri == URI_SUM
+
+
+# ---------------------------------------------------------------------------
+# Item 6 — provenance / meta
+# ---------------------------------------------------------------------------
+
+class TestProvenance:
+    def test_resolver_reads_meta(self, db_path):
+        from latincy_ext.lila_linker import LilaResolver
+        assert LilaResolver(db_path).meta().get("backbone_license") == "CC-BY-SA 4.0"
+
+    def test_component_exposes_meta(self, linker):
+        assert linker.meta_info.get("backbone_license") == "CC-BY-SA 4.0"
